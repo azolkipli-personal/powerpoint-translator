@@ -38,11 +38,18 @@ export async function POST(request: NextRequest) {
     // Get the binary PPTX file
     const arrayBuffer = await response.arrayBuffer();
 
+    // Content-Disposition header must be ASCII. For non-ASCII (e.g. Japanese)
+    // filenames, use RFC 5987 filename*=UTF-8''encoding with an ASCII fallback,
+    // otherwise Next.js throws "Cannot convert argument to a ByteString" -> 500.
+    const asciiFallback = 'translated.pptx';
+    const encodedFilename = encodeURIComponent(filename || asciiFallback);
+    const contentDisposition = `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`;
+
     return new NextResponse(arrayBuffer, {
       status: 200,
       headers: {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'Content-Disposition': `attachment; filename="${filename || 'translated.pptx'}"`,
+        'Content-Disposition': contentDisposition,
       },
     });
 

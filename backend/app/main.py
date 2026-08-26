@@ -8,7 +8,9 @@ from pydantic import BaseModel
 from typing import Optional
 import uuid
 import os
+import re
 import asyncio
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import shutil
@@ -37,6 +39,19 @@ from app.google_slides.service import (
     create_translated_presentation,
 )
 
+
+# ── Increase default multipart part size from 1MB → 100MB ──
+# Starlette's MultiPartParser (used by Request.form()) rejects parts >1MB by default.
+# The app-level max_file_size (100MB in config.py) never gets reached because
+# this multipart parser limit fires first with "There was an error parsing the body".
+from starlette.requests import Request as StarletteRequest
+
+_orig_get_form = StarletteRequest._get_form
+
+async def _patched_get_form(self, *, max_files=1000, max_fields=1000, max_part_size=100 * 1024 * 1024):
+    return await _orig_get_form(self, max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+
+StarletteRequest._get_form = _patched_get_form
 
 # Create FastAPI app
 app = FastAPI(
@@ -67,6 +82,11 @@ translation_service = TranslationService(settings)
 # Translation memory
 tm = get_translation_memory()
 
+# Job persistence (SQLite — survives restarts)
+from app.job_store import get_job_store
+
+job_store = get_job_store()
+
 
 CLEANUP_INTERVAL = 3600  # Run cleanup every hour
 
@@ -83,6 +103,13 @@ def cleanup_old_files():
                 if mtime < cutoff:
                     item.unlink()
                     print(f"  [CLEANUP] Deleted old file: {item}")
+    # Prune stale job rows (files are gone; jobs are useless without them)
+    try:
+        pruned = job_store.delete_old(hours=24)
+        if pruned:
+            print(f"  [CLEANUP] Pruned {pruned} old job row(s)")
+    except Exception as e:
+        print(f"  [CLEANUP] Job store prune error: {e}")
 
 
 async def run_cleanup_periodically():
@@ -98,6 +125,15 @@ async def run_cleanup_periodically():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start and stop background cleanup task with the app."""
+    # Hydrate in-memory jobs from SQLite (restart recovery)
+    try:
+        restored = job_store.load_all()
+        if restored:
+            jobs.update(restored)
+            print(f"  [JOBSTORE] Restored {len(restored)} job(s) from SQLite")
+    except Exception as e:
+        print(f"  [JOBSTORE] Startup hydration failed: {e}")
+
     cleanup_task = asyncio.create_task(run_cleanup_periodically())
     yield
     cleanup_task.cancel()
@@ -186,15 +222,31 @@ def sanitize_translation(text: str, original: str) -> str:
     return result if result else original
 
 
-def sanitize_translated_runs(translated_runs: list[TranslatedRun]) -> list[TranslatedRun]:
-    """Sanitize all translated runs to remove contamination."""
+def sanitize_translated_runs(translated_runs: list[TranslatedRun], glossary: Optional[list[str]] = None) -> list[TranslatedRun]:
+    """Sanitize all translated runs to remove contamination + enforce glossary terms."""
     for tr in translated_runs:
         cleaned = sanitize_translation(tr.translated_text, tr.original_text)
         if cleaned != tr.translated_text:
             print(f"  [SANITIZE] Run {tr.run_id}: stripped contamination: {tr.translated_text[:50]} → {cleaned[:50]}")
+        # Glossary enforcement (post-pass): restore any term the model translated anyway.
+        # Only applies to terms actually present in this run's source text.
+        if glossary and tr.original_text:
+            for term in glossary:
+                if term.lower() in tr.original_text.lower() and term not in cleaned:
+                    # Case-normalize occurrences already present (e.g. "apple" -> "Apple").
+                    cleaned = re.sub(re.escape(term), term, cleaned, flags=re.IGNORECASE)
+                    if term not in cleaned:
+                        # Model translated the term away entirely; restoration
+                        # without re-translating isn't possible — log it so the
+                        # gap is visible instead of silently claiming success.
+                        print(f"  [GLOSSARY] Run {tr.run_id}: term '{term}' not restorable (translated away)")
+                    else:
+                        print(f"  [GLOSSARY] Run {tr.run_id}: enforced term '{term}'")
         tr.translated_text = cleaned
     return translated_runs
 jobs: dict[str, TranslationJob] = {}
+# job_id -> monotonic timestamp when translation started (for notify timing)
+_job_started_at: dict[str, float] = {}
 
 
 class UploadResponse(BaseModel):
@@ -269,7 +321,9 @@ async def upload_pptx(file: UploadFile = File(...)):
             total_runs=document.total_runs,
             translated_runs=[],
             progress=0.0,
+            slides=document.slides, # Store extracted slides for rehydration
         )
+        job_store.save(jobs[job_id])
         
         # Prepare response
         slides_data = [
@@ -333,6 +387,8 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
         jobs[job_id].total_runs = len(request.runs)
         jobs[job_id].progress = 0.0
     else:
+        # On new job creation in translate endpoint, filename and slides are unknown.
+        # Should be rare, as translate usually follows upload.
         jobs[job_id] = TranslationJob(
             job_id=job_id,
             filename="",
@@ -340,8 +396,13 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             total_runs=len(request.runs),
             translated_runs=[],
             progress=0.0,
+            slides=[], # No slides available during translate-only creation
         )
-    
+    job_store.save(jobs[job_id])
+
+    # Remember wall-clock start for completion notifications
+    _job_started_at[job_id] = time.monotonic()
+
     # Process translations in batch with concurrency
     translated_runs = []
     tm = get_translation_memory()
@@ -355,7 +416,17 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             context = request.context.strip()
     else:
         context = glossary_context
-    
+
+    # User glossary: instruct the model to preserve these terms verbatim
+    if request.glossary:
+        glossary_list = "\n".join(f"- {term}" for term in request.glossary)
+        glossary_instruction = (
+            "CRITICAL: The following terms are brand names / product names. "
+            "Do NOT translate them. Copy them EXACTLY as written wherever they appear:\n"
+            f"{glossary_list}"
+        )
+        context = f"{context}\n\n{glossary_instruction}" if context else glossary_instruction
+
     # Prepare texts for batch translation
     texts_to_translate = [(run.run_id, run.text) for run in request.runs]
     
@@ -381,6 +452,13 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
     # Translate uncached texts in batch with concurrency
     if uncached:
         uncached_texts = [t[1] for t in uncached]
+        cached_count = len(translated_runs)
+
+        def report_batch_progress(done: int):
+            pct = (cached_count + done) / len(request.runs) * 100
+            jobs[job_id].progress = round(min(pct, 99.0), 1)
+            job_store.save(jobs[job_id])  # throttled inside the store
+
         batch_results = await translation_service.batch_translate(
             texts=uncached_texts,
             source_lang=request.source_language,
@@ -388,6 +466,7 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
             model=request.model,
             context=context,
             concurrency=5,
+            progress_callback=report_batch_progress,
         )
         
         for (run_id, text), (translated_text, model_used, success) in zip(uncached, batch_results):
@@ -408,13 +487,14 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
                 source_language=request.source_language,
                 target_language=request.target_language,
                 model_used=model_used,
+                success=success,
             ))
     
     # Sort by run_id to maintain original order
     translated_runs.sort(key=lambda tr: tr.run_id)
     
-    # Sanitize all translations to strip contamination
-    translated_runs = sanitize_translated_runs(translated_runs)
+    # Sanitize all translations to strip contamination + enforce glossary
+    translated_runs = sanitize_translated_runs(translated_runs, request.glossary)
     
     # Update job progress
     jobs[job_id].translated_runs = translated_runs
@@ -423,7 +503,26 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
     # Mark job as completed
     jobs[job_id].status = "completed"
     jobs[job_id].progress = 100.0
-    
+    job_store.save(jobs[job_id])
+
+    # Telegram ping for long jobs (fire-and-forget, >60s only)
+    from app.notify import maybe_notify_job_done
+    started = _job_started_at.pop(job_id, None)
+    if started is not None:
+        # Count only runs where every provider failed (success=False →
+        # original text passed through). Identity outputs from successful
+        # calls (numbers, dates, brand names) are NOT failures.
+        failed_count = sum(
+            1 for tr in translated_runs
+            if not tr.success and tr.original_text == tr.translated_text
+        )
+        maybe_notify_job_done(
+            jobs[job_id].filename or "presentation.pptx",
+            len(translated_runs),
+            started,
+            failed_count,
+        )
+
     return TranslateResponse(
         job_id=job_id,
         status="completed",
@@ -435,11 +534,25 @@ async def translate_pptx(request: TranslationRequest, background_tasks: Backgrou
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
-    """Get job status."""
-    if job_id not in jobs:
+    """Get job status. Falls back to SQLite if not in memory (post-restart)."""
+    job = jobs.get(job_id)
+    if job is None:
+        job = job_store.load(job_id)
+        if job is not None:
+            jobs[job_id] = job  # rehydrate memory
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    return jobs[job_id]
+    # Return full job (translated runs included) so a refreshed browser
+    # can recover its session without re-translating.
+    return job
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Forget a job (memory + SQLite). Files on disk are left for the hourly cleanup."""
+    jobs.pop(job_id, None)
+    job_store.delete(job_id)
+    return {"ok": True}
 
 
 @app.post("/api/export")

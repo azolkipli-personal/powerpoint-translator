@@ -88,6 +88,7 @@ class TranslationRequest(BaseModel):
     target_language: str = "en"  # english default
     model: str = "auto"  # auto, glm, kimi, minimax, qwen, ollama
     context: Optional[str] = None
+    glossary: Optional[list[str]] = None # New field for glossary terms
     job_id: Optional[str] = None  # upload job_id to track progress
 
 
@@ -99,7 +100,12 @@ class TranslatedRun(BaseModel):
     source_language: str
     target_language: str
     model_used: str
-    
+
+    # False when every provider (incl. failover) failed and the original
+    # text was passed through. Identity outputs with success=True are
+    # legitimate (numbers, dates, brand names).
+    success: bool = True
+
     # Font size adjustment if needed
     adjusted_font_size: Optional[float] = None
     adjustment_reason: Optional[str] = None  # "overflow" or "underflow"
@@ -114,6 +120,7 @@ class TranslationJob(BaseModel):
     translated_runs: list[TranslatedRun] = []
     progress: float = 0.0
     error: Optional[str] = None
+    slides: list[Slide] = [] # Added for frontend rehydration
 
 
 class TranslationMemoryEntry(BaseModel):

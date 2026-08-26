@@ -1,43 +1,70 @@
 'use client';
 
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 
-// ──────────────────────────────────────────────────────────────────
-//  Types
-// ──────────────────────────────────────────────────────────────────
+// --- Types (mirror translator page) ---
+interface TextRun { run_id: string; text: string; style: { font_size: number | null; font_color: string | null; font_name: string | null; bold: boolean; italic: boolean; underline: boolean; }; }
+interface TextBox { box_id: string; shape_type: string; runs: TextRun[]; constraints: { left: number; top: number; width: number; height: number; }; }
+interface Slide { slide_index: number; slide_id: number; text_boxes: TextBox[]; }
+interface SlidesDocument { presentation_id: string; filename: string; total_slides: number; total_runs: number; slides: Slide[]; }
+interface TranslatedRun { run_id: string; original_text: string; translated_text: string; model_used: string; }
+interface Presentation { id: string; name: string; }
 
-interface SlidesPresentation {
-  id: string;
-  name: string;
-  modifiedTime?: string;
-  owners?: { displayName: string }[];
-}
+const en = {
+  authenticateFirst: 'Connect your Google account to translate Google Slides presentations.',
+  connect: 'Connect Google Account',
+  connecting: 'Connecting…',
+  selectPresentation: 'Select a presentation',
+  disconnect: 'Disconnect',
+  loadingPresentations: 'Loading presentations…',
+  noPresentations: 'No presentations found',
+  reload: 'Reload',
+  runs: 'text runs',
+  slides: 'slides',
+  translate: 'Translate',
+  translating: 'Translating…',
+  download: 'Download PPTX',
+  exporting: 'Exporting…',
+  startOver: 'Start over',
+  done: 'done',
+  failed: 'failed',
+  original: 'Original',
+  translation: 'Translation',
+  translateFailed: 'Translation failed',
+  exportFailed: 'Export failed',
+  noRuns: 'No text runs found to translate',
+  slideLabel: 'Slide',
+};
+const ja: typeof en = {
+  authenticateFirst: 'Googleスライドを翻訳するには、Googleアカウントと連携してください。',
+  connect: 'Googleアカウントと連携',
+  connecting: '接続中…',
+  selectPresentation: 'プレゼンテーションを選択',
+  disconnect: '連携解除',
+  loadingPresentations: 'プレゼンテーションを読み込み中…',
+  noPresentations: 'プレゼンテーションが見つかりません',
+  reload: '再読み込み',
+  runs: 'テキスト',
+  slides: 'スライド',
+  translate: '翻訳する',
+  translating: '翻訳中…',
+  download: 'PPTXをダウンロード',
+  exporting: 'エクスポート中…',
+  startOver: '最初から',
+  done: '完了',
+  failed: '失敗',
+  original: '原文',
+  translation: '翻訳文',
+  translateFailed: '翻訳失敗',
+  exportFailed: 'エクスポート失敗',
+  noRuns: '翻訳するテキストが見つかりません',
+  slideLabel: 'スライド',
+};
 
-interface SlidesExtractResult {
-  presentation_id: string;
-  title: string;
-  total_slides: number;
-  total_runs: number;
-  slides: { slide_index: number; slide_object_id: string; text_boxes: { page_element_id: string; shape_type: string; runs: { run_id: string; text: string; style: Record<string, unknown> }[] }[] }[];
-  runs: { run_id: string; text: string; style: Record<string, unknown> }[];
-}
+type Lang = 'en' | 'ja';
+const t = (lang: Lang) => lang === 'en' ? en : ja;
 
-interface SlidesTranslateResult {
-  new_presentation_id: string;
-  new_title: string;
-  new_url: string;
-  total_runs: number;
-  translated_runs: number;
-  model_used: string;
-}
-
-type SlidesPhase = 'idle' | 'auth_check' | 'listing' | 'selecting' | 'loading' | 'ready' | 'translating' | 'done' | 'error';
-
-// ──────────────────────────────────────────────────────────────────
-//  Props
-// ──────────────────────────────────────────────────────────────────
-
-interface SlidesPanelProps {
+interface Props {
   ui: 'en' | 'ja';
   sourceLang: 'ja' | 'en';
   targetLang: 'ja' | 'en';
@@ -45,479 +72,280 @@ interface SlidesPanelProps {
   contextPrompt: string;
 }
 
-const text = (ui: 'en' | 'ja') =>
-  ui === 'en'
-    ? {
-        connect: 'Connect Google Slides',
-        connecting: 'Connecting...',
-        connected: '✅ Connected',
-        disconnect: 'Disconnect',
-        selectPresentation: 'Select a presentation to translate',
-        loadingPresentations: 'Loading presentations...',
-        noPresentations: 'No presentations found in your Drive',
-        name: 'Name',
-        modified: 'Modified',
-        slides: 'slides',
-        runs: 'text runs',
-        readyToTranslate: 'Ready to translate',
-        totalRuns: 'total text runs',
-        translateToSlides: 'Translate & Create Slides',
-        translating: 'Translating...',
-        translated: 'Translation complete!',
-        openInSlides: 'Open in Google Slides',
-        newTitle: 'Translated copy title (optional)',
-        newTitlePlaceholder: 'e.g., My Deck (English)',
-        startOver: 'Start over',
-        authenticateFirst: 'Connect your Google account to get started.',
-        extractText: 'Extracting text from presentation...',
-        content: 'Content',
-        noTextRuns: 'No text content found in this presentation.',
-        authError: 'Authentication failed. Please try again.',
-        listError: 'Could not load presentations. Check your connection.',
-        translateError: 'Translation failed. Please try again.',
-        connectLink: 'Click to connect →',
-      }
-    : {
-        connect: 'Google Slidesに接続',
-        connecting: '接続中...',
-        connected: '✅ 接続済み',
-        disconnect: '切断',
-        selectPresentation: '翻訳するプレゼンテーションを選択',
-        loadingPresentations: 'プレゼンテーションを読み込み中...',
-        noPresentations: 'Driveにプレゼンテーションが見つかりません',
-        name: '名前',
-        modified: '更新日',
-        slides: 'スライド',
-        runs: 'テキスト',
-        readyToTranslate: '翻訳準備完了',
-        totalRuns: 'テキスト数',
-        translateToSlides: '翻訳してSlidesを作成',
-        translating: '翻訳中...',
-        translated: '翻訳完了！',
-        openInSlides: 'Google Slidesで開く',
-        newTitle: '翻訳後のタイトル（任意）',
-        newTitlePlaceholder: '例：提案書（英語版）',
-        startOver: '最初から',
-        authenticateFirst: 'Googleアカウントに接続してください。',
-        extractText: 'プレゼンテーションからテキストを抽出中...',
-        content: '内容',
-        noTextRuns: 'このプレゼンテーションにテキストが見つかりません。',
-        authError: '認証に失敗しました。もう一度お試しください。',
-        listError: 'プレゼンテーションを読み込めませんでした。',
-        translateError: '翻訳に失敗しました。もう一度お試しください。',
-        connectLink: 'クリックして接続 →',
-      };
+export default function SlidesPanel({ ui, sourceLang, targetLang, model, contextPrompt }: Props) {
+  const lang = ui;
+  const text = t(lang);
 
-// ──────────────────────────────────────────────────────────────────
-//  Component
-// ──────────────────────────────────────────────────────────────────
-
-export default function SlidesPanel({ ui, sourceLang, targetLang, model, contextPrompt }: SlidesPanelProps) {
-  const t = text(ui);
-  const [phase, setPhase] = useState<SlidesPhase>('idle');
+  const [authStatus, setAuthStatus] = useState<'checking' | 'unauthenticated' | 'authenticated'>('checking');
+  const [presentations, setPresentations] = useState<Presentation[]>([]);
+  const [loadingPres, setLoadingPres] = useState(false);
+  const [presError, setPresError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<SlidesDocument | null>(null);
+  const [selecting, setSelecting] = useState(false);
+  const [translatedRuns, setTranslatedRuns] = useState<TranslatedRun[]>([]);
+  const [translating, setTranslating] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [presentations, setPresentations] = useState<SlidesPresentation[]>([]);
-  const [selectedPres, setSelectedPres] = useState<SlidesPresentation | null>(null);
-  const [extractResult, setExtractResult] = useState<SlidesExtractResult | null>(null);
-  const [translateResult, setTranslateResult] = useState<SlidesTranslateResult | null>(null);
-  const [newTitle, setNewTitle] = useState('');
+  const [progress, setProgress] = useState(0);
 
-  // Check auth status on mount
   useEffect(() => {
-    checkAuth();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    fetch('/api/slides/auth/status')
+      .then(r => r.json())
+      .then(data => {
+        const authed = data?.authenticated === true;
+        setAuthStatus(authed ? 'authenticated' : 'unauthenticated');
+        if (authed) loadPresentations();
+      })
+      .catch(() => setAuthStatus('unauthenticated'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const checkAuth = async () => {
-    try {
-      const res = await fetch('/api/slides/auth/status');
-      const data = await res.json();
-      if (data.authenticated) {
-        setPhase('selecting');
-        loadPresentations();
-      } else {
-        setPhase('idle');
-      }
-    } catch {
-      setPhase('idle');
-    }
-  };
+  function loadPresentations() {
+    setLoadingPres(true);
+    setPresError(null);
+    fetch('/api/slides/presentations')
+      .then(r => {
+        if (!r.ok) throw new Error('failed');
+        return r.json();
+      })
+      .then(data => setPresentations(data.presentations || []))
+      .catch(() => setPresError('Failed to load presentations'))
+      .finally(() => setLoadingPres(false));
+  }
 
-  const handleConnect = async () => {
-    setPhase('auth_check');
+  function handleConnect() {
+    setAuthStatus('checking');
+    fetch('/api/slides/auth/url')
+      .then(r => r.json())
+      .then(data => {
+        if (data?.url) {
+          window.location.href = data.url;
+        } else {
+          setAuthStatus('unauthenticated');
+        }
+      })
+      .catch(() => setAuthStatus('unauthenticated'));
+  }
+
+  function handleDisconnect() {
+    fetch('/api/slides/auth/logout', { method: 'POST' }).finally(() => {
+      setAuthStatus('unauthenticated');
+      setPresentations([]);
+      setSelected(null);
+    });
+  }
+
+  function handleSelect(pres: Presentation) {
+    setSelecting(true);
     setErrorMsg(null);
-    try {
-      const res = await fetch('/api/slides/auth/url');
-      const data = await res.json();
-      if (data.url) {
-        // Redirect browser to Google OAuth
-        window.location.href = data.url;
-      } else {
-        setPhase('idle');
-        setErrorMsg(t.authError);
-      }
-    } catch {
-      setPhase('idle');
-      setErrorMsg(t.authError);
-    }
-  };
+    fetch(`/api/slides/read/${encodeURIComponent(pres.id)}`)
+      .then(r => {
+        if (!r.ok) throw new Error('failed');
+        return r.json();
+      })
+      .then((data: SlidesDocument) => {
+        setSelected(data);
+        setTranslatedRuns([]);
+      })
+      .catch(() => setErrorMsg('Failed to open presentation'))
+      .finally(() => setSelecting(false));
+  }
 
-  const handleDisconnect = async () => {
-    await fetch('/api/slides/auth/logout', { method: 'POST' });
-    setPhase('idle');
-    setPresentations([]);
-    setSelectedPres(null);
-    setExtractResult(null);
-    setTranslateResult(null);
-  };
-
-  const loadPresentations = async () => {
-    setPhase('listing');
+  async function handleTranslate() {
+    if (!selected) return;
+    setTranslating(true);
     setErrorMsg(null);
+    setProgress(0);
     try {
-      const res = await fetch('/api/slides/presentations');
-      if (res.status === 401) {
-        setPhase('idle');
-        setErrorMsg(t.authError);
-        return;
-      }
-      if (!res.ok) {
-        setPhase('error');
-        setErrorMsg(t.listError);
-        return;
-      }
-      const data = await res.json();
-      setPresentations(data.presentations || []);
-      setPhase('selecting');
-    } catch {
-      setPhase('error');
-      setErrorMsg(t.listError);
-    }
-  };
-
-  const handleSelectPresentation = async (pres: SlidesPresentation) => {
-    setSelectedPres(pres);
-    setExtractResult(null);
-    setTranslateResult(null);
-    setPhase('loading');
-    setErrorMsg(null);
-    setNewTitle(`Translated - ${pres.name}`);
-
-    try {
-      const res = await fetch(`/api/slides/read/${encodeURIComponent(pres.id)}`);
-      if (!res.ok) {
-        setPhase('error');
-        setErrorMsg(t.listError);
-        return;
-      }
-      const data: SlidesExtractResult = await res.json();
-      setExtractResult(data);
-      setPhase('ready');
-    } catch {
-      setPhase('error');
-      setErrorMsg(t.extractText + ' ' + t.listError);
-    }
-  };
-
-  const handleTranslateToSlides = async () => {
-    if (!selectedPres || !extractResult) return;
-    setPhase('translating');
-    setErrorMsg(null);
-
-    try {
+      const allRuns: TextRun[] = [];
+      for (const slide of selected.slides) for (const textBox of slide.text_boxes) allRuns.push(...textBox.runs);
+      if (allRuns.length === 0) throw new Error(text.noRuns);
+      const body: Record<string, unknown> = {
+        presentation_id: selected.presentation_id,
+        runs: allRuns,
+        source_language: sourceLang,
+        target_language: targetLang,
+        model,
+      };
+      if (contextPrompt.trim()) body.context = contextPrompt.trim();
       const res = await fetch('/api/slides/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          presentation_id: selectedPres.id,
-          source_language: sourceLang,
-          target_language: targetLang,
-          model,
-          context: contextPrompt || null,
-          new_title: newTitle || null,
-        }),
+        body: JSON.stringify(body),
       });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        setPhase('error');
-        setErrorMsg(errData.error || t.translateError);
-        return;
-      }
-
-      const result: SlidesTranslateResult = await res.json();
-      setTranslateResult(result);
-      setPhase('done');
-    } catch {
-      setPhase('error');
-      setErrorMsg(t.translateError);
+      if (!res.ok) throw new Error(text.translateFailed);
+      const data = await res.json();
+      setTranslatedRuns(data.translated_runs || []);
+      setProgress(100);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : text.translateFailed);
+    } finally {
+      setTranslating(false);
     }
-  };
-
-  const handleStartOver = () => {
-    setSelectedPres(null);
-    setExtractResult(null);
-    setTranslateResult(null);
-    setErrorMsg(null);
-    setPhase('selecting');
-  };
-
-  // ────────────────────────────────────────────────────────────
-  //  Helpers
-  // ────────────────────────────────────────────────────────────
-
-  const formatDate = (dateStr?: string) => {
-    if (!dateStr) return '';
-    try {
-      return new Date(dateStr).toLocaleDateString(ui === 'ja' ? 'ja-JP' : 'en-US', {
-        year: 'numeric', month: 'short', day: 'numeric',
-      });
-    } catch {
-      return dateStr;
-    }
-  };
-
-  // ────────────────────────────────────────────────────────────
-  //  Render
-  // ────────────────────────────────────────────────────────────
-
-  if (phase === 'idle') {
-    return (
-      <div className="max-w-xl mx-auto mt-8">
-        <div className="bg-white border border-gray-200 rounded-xl p-8 text-center">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-50 mb-4">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" strokeWidth="1.5">
-              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-            </svg>
-          </div>
-          <h2 className="text-lg font-medium text-gray-800 mb-2">Google Slides</h2>
-          <p className="text-sm text-gray-500 mb-5">{t.authenticateFirst}</p>
-          <button onClick={handleConnect}
-            className="px-6 py-2.5 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-sm inline-flex items-center gap-2">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-            {t.connect}
-          </button>
-          {errorMsg && <p className="mt-4 text-sm text-red-600">{errorMsg}</p>}
-        </div>
-      </div>
-    );
   }
 
-  if (phase === 'auth_check') {
+  async function handleExport() {
+    if (!selected || translatedRuns.length === 0) return;
+    setExporting(true);
+    setErrorMsg(null);
+    try {
+      const res = await fetch('/api/export-new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: selected.presentation_id, filename: `translated_${selected.filename}` }),
+      });
+      if (!res.ok) throw new Error(text.exportFailed);
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = window.document.createElement('a');
+      a.href = url;
+      a.download = `translated_${selected.filename}`;
+      window.document.body.appendChild(a);
+      a.click();
+      window.document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : text.exportFailed);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const completedCount = translatedRuns.filter(r => r.original_text !== r.translated_text || r.model_used === 'cache').length;
+  const failedCount = translatedRuns.filter(r => r.original_text === r.translated_text && r.model_used !== 'cache').length;
+  const allDone = selected && translatedRuns.length > 0 && !translating;
+
+  if (authStatus === 'checking') {
     return (
       <div className="max-w-xl mx-auto mt-8">
-        <div className="bg-white border border-gray-200 rounded-xl p-6 text-center">
+        <div className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-8 text-center">
           <svg className="animate-spin h-6 w-6 text-blue-500 mx-auto mb-3" viewBox="0 0 24 24" fill="none">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <p className="text-sm text-gray-500">{t.connecting}</p>
+          <p className="text-sm text-gray-500 dark:text-zinc-400">{text.connecting}</p>
         </div>
       </div>
     );
   }
 
-  // ── Presentation list / selection ──
-  if (phase === 'listing' || phase === 'selecting') {
+  if (authStatus === 'unauthenticated') {
     return (
-      <div className="max-w-2xl mx-auto mt-8">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-base font-medium text-gray-700">{t.selectPresentation}</h2>
-          <button onClick={handleDisconnect} className="text-xs text-gray-400 hover:text-red-500 transition-colors">
-            {t.disconnect}
-          </button>
-        </div>
-
-        {phase === 'listing' ? (
-          <div className="bg-white border border-gray-200 rounded-xl p-6 text-center">
-            <svg className="animate-spin h-5 w-5 text-blue-500 mx-auto mb-2" viewBox="0 0 24 24" fill="none">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+      <div className="max-w-xl mx-auto mt-8">
+        <div className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-8 text-center">
+          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-50 dark:bg-blue-950/50 mb-4">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#1a73e8" strokeWidth="1.5">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
             </svg>
-            <p className="text-sm text-gray-500">{t.loadingPresentations}</p>
           </div>
-        ) : presentations.length === 0 ? (
-          <div className="bg-white border border-gray-200 rounded-xl p-8 text-center">
-            <p className="text-sm text-gray-500">{t.noPresentations}</p>
-            <button onClick={loadPresentations} className="mt-3 text-sm text-blue-600 hover:underline">
-              {ui === 'en' ? 'Refresh' : '更新'}
-            </button>
-          </div>
-        ) : (
-          <div className="space-y-2 max-h-96 overflow-y-auto">
-            {presentations.map((pres) => (
-              <button
-                key={pres.id}
-                onClick={() => handleSelectPresentation(pres)}
-                className="w-full text-left bg-white border border-gray-200 hover:border-blue-300 hover:bg-blue-50/30 rounded-xl p-4 transition-all"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-medium text-gray-800 truncate">{pres.name}</p>
-                    <p className="text-xs text-gray-400 mt-1">
-                      {formatDate(pres.modifiedTime)}
-                      {pres.owners?.[0] && ` · ${pres.owners[0].displayName}`}
-                    </p>
-                  </div>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9aa0a6" strokeWidth="1.5" className="flex-shrink-0 mt-0.5">
-                    <polyline points="9 18 15 12 9 6" />
-                  </svg>
-                </div>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // ── Loading / extracting ──
-  if (phase === 'loading') {
-    return (
-      <div className="max-w-xl mx-auto mt-8">
-        <div className="bg-white border border-gray-200 rounded-xl p-6">
-          {selectedPres && <p className="text-sm font-medium text-gray-700 mb-4 truncate">{selectedPres.name}</p>}
-          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-            <div className="h-full bg-blue-500 rounded-full animate-pulse" style={{ width: '60%' }} />
-          </div>
-          <p className="text-xs text-gray-400 mt-3">{t.extractText}</p>
-        </div>
-      </div>
-    );
-  }
-
-  // ── Ready to translate ──
-  if (phase === 'ready' && extractResult && selectedPres) {
-    return (
-      <div className="max-w-2xl mx-auto mt-8">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-4">
-          <div className="min-w-0 flex-1">
-            <h2 className="text-base font-medium text-gray-700 truncate">{selectedPres.name}</h2>
-            <p className="text-xs text-gray-400">{extractResult.total_slides} {t.slides} · {extractResult.total_runs} {t.runs}</p>
-          </div>
-          <button onClick={handleStartOver} className="text-xs text-blue-600 hover:underline flex-shrink-0 ml-3">
-            {t.startOver}
+          <h2 className="text-lg font-medium text-gray-800 dark:text-zinc-100 mb-2">Google Slides</h2>
+          <p className="text-sm text-gray-500 dark:text-zinc-400 mb-5">{text.authenticateFirst}</p>
+          <button onClick={handleConnect}
+            className="px-6 py-2.5 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 transition-colors shadow-sm inline-flex items-center gap-2">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            {text.connect}
           </button>
+          {errorMsg && <p className="mt-4 text-sm text-red-600 dark:text-red-400">{errorMsg}</p>}
         </div>
-
-        {/* Content preview */}
-        <div className="bg-white border border-gray-200 rounded-xl p-4 mb-4 max-h-48 overflow-y-auto">
-          <h3 className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">{t.content}</h3>
-          {extractResult.runs.length > 0 ? (
-            <div className="space-y-1">
-              {extractResult.runs.slice(0, 30).map((run, i) => (
-                <p key={run.run_id} className="text-xs text-gray-600 leading-relaxed">
-                  <span className="text-gray-300 mr-1">[{run.text.length}c]</span>
-                  {run.text.length > 80 ? run.text.slice(0, 80) + '...' : run.text}
-                </p>
-              ))}
-              {extractResult.runs.length > 30 && (
-                <p className="text-xs text-gray-400 italic mt-1">
-                  ...and {extractResult.runs.length - 30} more {t.runs}
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="text-xs text-gray-400 italic">{t.noTextRuns}</p>
-          )}
-        </div>
-
-        {/* New title */}
-        <div className="mb-4">
-          <label className="block text-xs text-gray-500 mb-1">{t.newTitle}</label>
-          <input type="text" value={newTitle} onChange={e => setNewTitle(e.target.value)}
-            placeholder={t.newTitlePlaceholder}
-            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-700 placeholder:text-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
-        </div>
-
-        {/* Translate button */}
-        <button onClick={handleTranslateToSlides}
-          className="w-full px-6 py-3 rounded-xl text-sm font-medium text-white bg-green-600 hover:bg-green-700 transition-colors shadow-sm">
-          {t.translateToSlides} ({extractResult.total_runs} {t.runs})
-        </button>
-
-        {errorMsg && <p className="mt-3 text-sm text-red-600">{errorMsg}</p>}
       </div>
     );
   }
 
-  // ── Translating ──
-  if (phase === 'translating') {
-    return (
-      <div className="max-w-xl mx-auto mt-8">
-        <div className="bg-white border border-gray-200 rounded-xl p-6 text-center">
-          <svg className="animate-spin h-6 w-6 text-green-500 mx-auto mb-3" viewBox="0 0 24 24" fill="none">
+  return (
+    <div className="max-w-2xl mx-auto mt-8">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-base font-medium text-gray-700 dark:text-zinc-200">{text.selectPresentation}</h2>
+        <button onClick={handleDisconnect} className="text-xs text-gray-400 dark:text-zinc-500 hover:text-red-500 transition-colors">
+          {text.disconnect}
+        </button>
+      </div>
+
+      {loadingPres && (
+        <div className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-6 text-center">
+          <svg className="animate-spin h-5 w-5 text-blue-500 mx-auto mb-2" viewBox="0 0 24 24" fill="none">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <p className="text-sm text-gray-600">{t.translating}</p>
-          {selectedPres && <p className="text-xs text-gray-400 mt-1">{selectedPres.name}</p>}
+          <p className="text-sm text-gray-500 dark:text-zinc-400">{text.loadingPresentations}</p>
         </div>
-      </div>
-    );
-  }
+      )}
 
-  // ── Done ──
-  if (phase === 'done' && translateResult) {
-    return (
-      <div className="max-w-xl mx-auto mt-8">
-        <div className="bg-white border border-gray-200 rounded-xl p-8 text-center">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-green-50 mb-4">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2">
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          </div>
-          <h2 className="text-lg font-medium text-gray-800 mb-1">{t.translated}</h2>
-          <p className="text-sm text-gray-500 mb-2">
-            {translateResult.translated_runs}/{translateResult.total_runs} {t.runs}
-            {' · '}{translateResult.model_used}
-          </p>
-          <p className="text-sm text-gray-700 mb-6 truncate">{translateResult.new_title}</p>
+      {presError && !loadingPres && (
+        <div className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-8 text-center">
+          <p className="text-sm text-gray-500 dark:text-zinc-400">{presError}</p>
+          <button onClick={loadPresentations} className="mt-3 text-sm text-blue-600 hover:underline">{text.reload}</button>
+        </div>
+      )}
 
-          <a href={translateResult.new_url} target="_blank" rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 px-6 py-3 rounded-xl text-sm font-medium text-white bg-green-600 hover:bg-green-700 transition-colors shadow-sm">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-            </svg>
-            {t.openInSlides}
-          </a>
+      {!loadingPres && !presError && presentations.length === 0 && (
+        <div className="bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl p-8 text-center">
+          <p className="text-sm text-gray-500 dark:text-zinc-400">{text.noPresentations}</p>
+        </div>
+      )}
 
-          <div className="mt-6 flex justify-center gap-3">
-            <button onClick={handleStartOver}
-              className="px-4 py-2 rounded-lg text-sm font-medium text-gray-600 hover:text-gray-800 border border-gray-300 hover:border-gray-400 transition-colors">
-              {t.startOver}
+      {!loadingPres && !presError && presentations.length > 0 && (
+        <div className="space-y-2 max-h-96 overflow-y-auto">
+          {presentations.map(pres => (
+            <button key={pres.id} onClick={() => handleSelect(pres)} disabled={selecting}
+              className="w-full text-left bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50/30 dark:hover:bg-blue-950/30 rounded-xl p-4 transition-all">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-gray-800 dark:text-zinc-100 truncate">{pres.name}</p>
+                </div>
+                {selecting && <svg className="animate-spin h-4 w-4 text-blue-500 flex-shrink-0" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>}
+              </div>
             </button>
-            <button onClick={handleDisconnect}
-              className="px-4 py-2 rounded-lg text-sm font-medium text-gray-400 hover:text-red-500 border border-gray-200 hover:border-red-200 transition-colors">
-              {t.disconnect}
-            </button>
-          </div>
+          ))}
         </div>
-      </div>
-    );
-  }
+      )}
 
-  // ── Error ──
-  return (
-    <div className="max-w-xl mx-auto mt-8">
-      <div className="bg-white border border-red-200 rounded-xl p-6 text-center">
-        <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-red-50 mb-3">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="1.5">
-            <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
-          </svg>
+      {selected && (
+        <div className="mt-6">
+          <div className="flex items-center gap-2.5 mb-6 pb-4 border-b border-gray-200 dark:border-zinc-800">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" className="stroke-zinc-500 dark:stroke-zinc-400" strokeWidth="1.5">
+              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/>
+            </svg>
+            <span className="text-sm text-gray-700 dark:text-zinc-200 truncate">
+              {selected.filename} · {selected.total_slides} {text.slides}, {selected.total_runs} {text.runs}
+            </span>
+          </div>
+
+          {errorMsg && (
+            <div className="mb-4 px-4 py-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-lg text-sm text-red-700 dark:text-red-300">{errorMsg}</div>
+          )}
+
+          <div className="flex items-center gap-3">
+            <button onClick={handleTranslate} disabled={translating}
+              className="px-6 py-2.5 rounded-lg text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 dark:disabled:bg-zinc-700 disabled:text-gray-500 dark:disabled:text-zinc-500 transition-colors shadow-sm">
+              {translating ? text.translating : text.translate}
+            </button>
+            {allDone && (
+              <button onClick={handleExport} disabled={exporting}
+                className="px-6 py-2.5 rounded-lg text-sm font-medium text-white bg-green-600 hover:bg-green-700 disabled:bg-gray-300 dark:disabled:bg-zinc-700 transition-colors shadow-sm">
+                {exporting ? text.exporting : text.download}
+              </button>
+            )}
+            {translatedRuns.length > 0 && (
+              <div className="flex items-center gap-2 text-xs">
+                <span className="text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/50 px-2.5 py-1 rounded-full">{completedCount}/{translatedRuns.length} {text.done}</span>
+                {failedCount > 0 && <span className="text-yellow-700 dark:text-yellow-300 bg-yellow-50 dark:bg-yellow-950/50 px-2.5 py-1 rounded-full">{failedCount} {text.failed}</span>}
+              </div>
+            )}
+          </div>
+
+          {translating && (
+            <div className="mt-4">
+              <div className="flex items-center justify-between text-sm mb-2">
+                <span className="text-gray-500 dark:text-zinc-400">{text.translating}</span>
+                <span className="text-blue-600 font-medium">{progress}%</span>
+              </div>
+              <div className="h-2 bg-gray-100 dark:bg-zinc-800 rounded-full overflow-hidden">
+                <div className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+          )}
         </div>
-        <p className="text-sm text-red-600 mb-4">{errorMsg || t.translateError}</p>
-        <div className="flex justify-center gap-3">
-          <button onClick={handleStartOver}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-gray-600 border border-gray-300 hover:border-gray-400 transition-colors">
-            {t.startOver}
-          </button>
-          <button onClick={checkAuth}
-            className="px-4 py-2 rounded-lg text-sm font-medium text-blue-600 border border-blue-200 hover:bg-blue-50 transition-colors">
-            {ui === 'en' ? 'Retry' : '再試行'}
-          </button>
-        </div>
-      </div>
+      )}
     </div>
   );
 }

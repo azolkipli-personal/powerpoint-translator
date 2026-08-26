@@ -160,9 +160,12 @@ Translation:"""
                     data = response.json()
                     translated = data.get("choices", [{}])[0].get("message", {}).get("content", text)
                     return translated.strip(), True
+                print(f"OpenCode HTTP {response.status_code} ({self.model}): {response.text[:200]}")
                 return text, False
         except Exception as e:
-            print(f"OpenCode translation error: {e}")
+            # Include the exception type: many network errors stringify to an
+            # empty message (TimeoutError), which is useless for diagnosis.
+            print(f"OpenCode translation error [{type(e).__name__}]: {e}")
             return text, False
     
     def get_model_name(self) -> str:
@@ -508,9 +511,9 @@ class TranslationService:
             'gemini-25-flash-lite': GeminiTranslator(settings, 'gemini-2.5-flash-lite'),
             # OpenCode models (proxy to the best available)
             'opencode-deepseek': OpenCodeTranslator(settings, 'deepseek-v4-flash'),
-            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k2-5'),
-            'opencode-qwen': OpenCodeTranslator(settings, 'qwen-max'),
-            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m2-5'),
+            'opencode-kimi': OpenCodeTranslator(settings, 'kimi-k2.5'),
+            'opencode-qwen': OpenCodeTranslator(settings, 'qwen3.7-plus'),
+            'opencode-minimax': OpenCodeTranslator(settings, 'minimax-m2.5'),
             # Fallback / direct APIs (kept for compatibility)
             'glm': GLMTranslator(settings),
             'kimi': KimiTranslator(settings),
@@ -523,9 +526,9 @@ class TranslationService:
     def get_translator(self, model: str) -> TranslatorInterface:
         """Get the appropriate translator for a model."""
         if model == 'auto':
-            # Auto-select based on availability (Gemini flash-lite is fast & free)
+            # Auto-select based on availability (Gemini 2.5 Flash Lite avoids free tier spending caps)
             if self.settings.gemini_api_key:
-                return self.translators['gemini-flash-lite']
+                return self.translators['gemini-25-flash-lite']
             if self.settings.opencode_api_key:
                 return self.translators['opencode-deepseek']
             if self.settings.google_cloud_api_key:
@@ -548,6 +551,14 @@ class TranslationService:
         # Default to Gemini flash lite
         return self.translators.get('gemini-flash-lite', self.translators['gemini-flash-lite'])
     
+    def _failover_chain(self, model: str) -> list[str]:
+        """Fallback providers to try when the primary fails. Key-gated."""
+        if model.startswith('opencode'):
+            return ['gemini-25-flash-lite'] if self.settings.gemini_api_key else []
+        if model.startswith('gemini') or model == 'auto':
+            return ['opencode-deepseek'] if self.settings.opencode_api_key else []
+        return ['gemini-25-flash-lite'] if self.settings.gemini_api_key else []
+
     async def translate_text(
         self,
         text: str,
@@ -558,14 +569,31 @@ class TranslationService:
     ) -> tuple[str, str, bool]:
         """
         Translate text using the specified model.
-        
+        On provider failure, automatically falls back to an alternate provider
+        so a dead upstream doesn't poison a whole job with passthrough runs.
+
         Returns:
             (translated_text, model_used, success)
         """
         translator = self.get_translator(model)
         translated, success = await translator.translate(text, source_lang, target_lang, context)
-        return translated, translator.get_model_name(), success
-    
+        model_used = translator.get_model_name()
+
+        if success:
+            return translated, model_used, True
+
+        # Auto-failover: try alternate providers (one level deep, no loops)
+        for fb_key in self._failover_chain(model):
+            fb = self.translators.get(fb_key)
+            if fb is None:
+                continue
+            fb_translated, fb_success = await fb.translate(text, source_lang, target_lang, context)
+            if fb_success:
+                print(f"  [FAILOVER] {model_used} failed → {fb.get_model_name()} used")
+                return fb_translated, fb.get_model_name(), True
+
+        return translated, model_used, False
+
     async def batch_translate(
         self,
         texts: list[str],
@@ -574,18 +602,32 @@ class TranslationService:
         model: str = 'auto',
         context: Optional[str] = None,
         concurrency: int = 5,
+        progress_callback=None,
     ) -> list[tuple[str, str, bool]]:
         """
         Translate multiple texts concurrently.
-        
+
+        Args:
+            progress_callback: Optional sync callable invoked after each run
+                completes, receiving the count of completed runs so far.
+
         Returns:
             List of (translated_text, model_used, success)
         """
         semaphore = asyncio.Semaphore(concurrency)
-        
+        completed = 0
+
         async def translate_with_limit(text: str):
+            nonlocal completed
             async with semaphore:
-                return await self.translate_text(text, source_lang, target_lang, model, context)
-        
+                result = await self.translate_text(text, source_lang, target_lang, model, context)
+            if progress_callback is not None:
+                completed += 1
+                try:
+                    progress_callback(completed)
+                except Exception:
+                    pass  # progress reporting must never break translation
+            return result
+
         results = await asyncio.gather(*[translate_with_limit(t) for t in texts])
         return list(results)

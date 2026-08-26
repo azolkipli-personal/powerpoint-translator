@@ -10,13 +10,17 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
 
-    // Forward to Python backend
+    // Forward to Python backend.
+    // Undici's default headers timeout is 300s (5 min) — big decks (1000+ runs)
+    // with a slow/outage-hit translation API can take 10-15 min, so raise it
+    // explicitly. 20 min covers the worst legit case.
     const response = await fetch(`${PYTHON_BACKEND_URL}/api/translate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20 * 60 * 1000),
     });
 
     if (!response.ok) {

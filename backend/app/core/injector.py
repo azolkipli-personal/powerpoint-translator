@@ -33,6 +33,29 @@ CHAR_WIDTH_RATIOS = {
 }
 
 
+def estimate_visual_width(text: str) -> float:
+    """Estimate visual width of text. CJK chars are ~2.2x width of Latin chars in practice."""
+    cjk = sum(1 for c in text if '\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' or '\uff00' <= c <= '\uffef')
+    latin = len(text) - cjk
+    return cjk * 2.2 + latin * 1.0
+
+
+def calculate_font_scale(original_text: str, translated_text: str) -> float:
+    """
+    Calculate font scale factor to prevent overflow.
+    If translated text is visually wider than original, scale down proportionally.
+    Caps at 0.5x (don't make text too small).
+    """
+    orig_width = estimate_visual_width(original_text)
+    trans_width = estimate_visual_width(translated_text)
+    
+    if trans_width <= orig_width * 1.05:
+        return 1.0  # No scaling needed (within 5% tolerance)
+    
+    scale = orig_width / trans_width
+    return max(scale, 0.5)  # Don't go below 50%
+
+
 def estimate_text_width(text: str, font_size: float) -> float:
     """
     Estimate text width based on character content.
@@ -89,9 +112,10 @@ def check_text_fit(
     return True, None, None
 
 
-def set_run_text_safe(run, new_text: str):
+def set_run_text_safe(run, new_text: str, target_language: str = 'en'):
     """
     Safely set text on a run, preserving all formatting.
+    Switches font to Yu Gothic if target is Japanese.
     """
     # Store original properties
     original_font = run.font
@@ -117,6 +141,13 @@ def set_run_text_safe(run, new_text: str):
             run.font.color.rgb = original_font.color.rgb
     except Exception:
         pass  # Some properties might not be settable
+
+    # Switch to Yu Gothic for Japanese target text (overrides original font)
+    if target_language == 'ja':
+        try:
+            run.font.name = 'Yu Gothic'
+        except Exception:
+            pass
 
 
 def find_shape_by_index(shape, shape_idx: str) -> Optional[Shape]:
@@ -272,10 +303,20 @@ def replace_text_in_shape(
                 except Exception:
                     orig_font_size = None
                 
-                set_run_text_safe(run, translated_run.translated_text)
+                # Auto-scale font if translating to Japanese
+                scale = 1.0
+                if translated_run.target_language == 'ja':
+                    scale = calculate_font_scale(translated_run.original_text, translated_run.translated_text)
+                    if scale < 1.0 and orig_font_size:
+                        print(f"  [INJECTOR] scaling table font {orig_font_size.pt:.1f}pt → {orig_font_size.pt * scale:.1f}pt for run {translated_run.run_id}")
                 
-                if translated_run.adjusted_font_size:
-                    run.font.size = Pt(translated_run.adjusted_font_size)
+                set_run_text_safe(run, translated_run.translated_text, translated_run.target_language)
+                
+                adjusted_size = translated_run.adjusted_font_size
+                if scale < 1.0 and orig_font_size:
+                    adjusted_size = orig_font_size.pt * scale
+                if adjusted_size:
+                    run.font.size = Pt(adjusted_size)
                         
             except (IndexError, ValueError) as e:
                 failed_runs.append(translated_run)
@@ -328,11 +369,21 @@ def replace_text_in_shape(
                     except Exception:
                         pass
                     
-                    set_run_text_safe(run, tr.translated_text)
+                    # Auto-scale font if translating to Japanese (CJK wider per char)
+                    scale = 1.0
+                    if tr.target_language == 'ja':
+                        scale = calculate_font_scale(tr.original_text, tr.translated_text)
+                        if scale < 1.0 and orig_font_size:
+                            print(f"  [INJECTOR] scaling font {orig_font_size.pt:.1f}pt → {orig_font_size.pt * scale:.1f}pt for run {tr.run_id}")
+                    
+                    set_run_text_safe(run, tr.translated_text, tr.target_language)
                     
                     # Apply font size adjustment if explicitly set (from check_text_fit logic)
-                    if tr.adjusted_font_size:
-                        run.font.size = Pt(tr.adjusted_font_size)
+                    adjusted_size = tr.adjusted_font_size
+                    if scale < 1.0 and orig_font_size:
+                        adjusted_size = orig_font_size.pt * scale
+                    if adjusted_size:
+                        run.font.size = Pt(adjusted_size)
                 else:
                     failed_runs.append(tr)
                     
